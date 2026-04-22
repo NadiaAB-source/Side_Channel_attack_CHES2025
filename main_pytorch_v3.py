@@ -6,10 +6,10 @@ CHES 2025 Main Script (ConvTF Training + Evaluation)
 - Monitors Guessing Entropy (GE) each epoch
 """
 
-from src.dataloader import ToTensor_trace, Custom_Dataset
+from src.dataloader_v3 import ToTensor_trace, Custom_Dataset
 from src.net import ConvTF
 from src.trainer import trainer
-from src.utils import evaluate, AES_Sbox
+from src.utils import evaluate, AES_Sbox, calculate_HW
 import matplotlib.pyplot as plt
 import os
 import random
@@ -21,15 +21,15 @@ if __name__ == "__main__":
     # ---------------- Config ----------------
     dataset = "CHES_2025"
     model_type = "convtf"
-    leakage = "ID"  # "HW" or "ID"
+    leakage = "HW"  # "HW" or "ID"
     train_models = True
     num_epochs = 10
     total_num_models = 2  # Train multiple seeds/configs for robustness
     nb_traces_attacks = 5000
     total_nb_traces_attacks = 10000
 
-    # ---------------- Directories ----------------
-    root = "./Result00/"
+        # ---------------- Directories ----------------
+    root = "./Result33/"
     save_root = os.path.join(root, f"{dataset}_{model_type}_{leakage}")
     model_root = os.path.join(save_root, "models")
 
@@ -53,148 +53,114 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = False
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-   # ---------------- Leakage Model ----------------
+    # ---------------- Leakage Model ----------------
     nb_attacks = 100
 
     if leakage == 'ID':
         def leakage_fn(att_plt, k):
+            # make sure plaintext is scalar
             if isinstance(att_plt, np.ndarray):
                 att_plt = att_plt[0]
             return AES_Sbox[k ^ int(att_plt)]
         classes = 256
 
-    
+    else:  # HW
+        def leakage_fn(att_plt, k):
+            # make sure plaintext is scalar
+            if isinstance(att_plt, np.ndarray):
+                att_plt = att_plt[0]
+            return bin(AES_Sbox[k ^ int(att_plt)]).count("1")
+        classes = 9
     # ---------------- Dataset ----------------
     dataloader = Custom_Dataset(
         root='./../', dataset=dataset, leakage=leakage,
         transform=ToTensor_trace()
     )
 
+    # Convert labels for HW leakage if needed
+    if leakage == "HW":
+        dataloader.Y_profiling = np.array(calculate_HW(dataloader.Y_profiling))
+        dataloader.Y_attack = np.array(calculate_HW(dataloader.Y_attack))
+
     # Split profiling/attack sets into train/val/test
     dataloader.split_attack_set_validation_test()
 
-    # ---------------- Validation loader FIRST ----------------
+    # ---------------- Prepare DataLoaders ----------------
+    # Training loader (profiling set)
+    dataloader.choose_phase("train")
+    train_loader = torch.utils.data.DataLoader(
+        dataloader, batch_size=256, shuffle=True
+    )
+
+    # Validation loader (attack validation split)
     dataloader.choose_phase("validation")
     val_loader = torch.utils.data.DataLoader(
         dataloader, batch_size=256, shuffle=False
     )
 
-    # ---------------- Training phase ----------------
+    # Return to train phase for next loop
     dataloader.choose_phase("train")
 
-    # ---------------- MIX ATTACK INTO TRAINING ----------------
-    num_attack_train = 80000  # use 80K attack for training
+    dataloaders = {"train": train_loader, "val": val_loader}
+    dataset_sizes = {"train": len(train_loader.dataset), "val": len(val_loader.dataset)}
 
-    X_mix = np.concatenate([
-        dataloader.X_profiling,
-        dataloader.X_attack[:num_attack_train]
-    ], axis=0).copy()
-
-    Y_mix = np.concatenate([
-        dataloader.Y_profiling,
-        dataloader.Y_attack[:num_attack_train]
-    ], axis=0).copy()
-
-    # overwrite training set
-    dataloader.X_profiling = X_mix
-    dataloader.Y_profiling = Y_mix
-
-    # ---------------- Attack set for evaluation ----------------
-    correct_key = 127
-
-    X_attack = dataloader.X_attack[num_attack_train:]
-    plt_attack = dataloader.plt_attack[num_attack_train:]
-
-    # Ensure plaintext is 1D
-    if len(plt_attack.shape) > 1:
-        plt_attack = plt_attack[:, 0]
-
+    # Attack set for final evaluation
+    correct_key = dataloader.correct_key
+    X_attack = dataloader.X_attack
+    plt_attack = dataloader.plt_attack
     num_sample_pts = X_attack.shape[-1]
 
     # ---------------- Train Multiple Configurations ----------------
     for num_models in range(total_num_models):
-
         config_path = os.path.join(model_root, f"model_configuration_{num_models}.npy")
         model_path = os.path.join(model_root, f"model_{num_models}.pth")
 
         if train_models:
-            # Random search hyperparameters
+            # Random search hyperparameters for ConvTF
             config = {
                 "batch_size": int(np.random.choice([128, 256])),
                 "lr": float(np.random.uniform(0.002, 0.004)),
                 "heads": int(np.random.choice([4, 8])),
                 "layers": int(np.random.choice([3, 4]))
             }
-
             np.save(config_path, config)
             print("CONFIG:", config)
 
-            # ---------------- Loaders (updated batch size) ----------------
+            # Rebuild loaders with updated batch size
             train_loader = torch.utils.data.DataLoader(
-                dataloader,
-                batch_size=config["batch_size"],
-                shuffle=True,
-                num_workers=2
+                dataloader, batch_size=config["batch_size"], shuffle=True, num_workers=2
             )
-
-            # validation loader already correct (no mixing)
-            dataloader.choose_phase("validation")
             val_loader = torch.utils.data.DataLoader(
-                dataloader,
-                batch_size=config["batch_size"],
-                shuffle=False,
-                num_workers=2
+                dataloader, batch_size=config["batch_size"], shuffle=False, num_workers=2
             )
-
-            # IMPORTANT: switch back to train
-            dataloader.choose_phase("train")
-
             dataloaders = {"train": train_loader, "val": val_loader}
-            dataset_sizes = {
-                "train": len(train_loader.dataset),
-                "val": len(val_loader.dataset)
-            }
-
+            dataset_sizes = {"train": len(train_loader.dataset), "val": len(val_loader.dataset)}
             print("Profiling traces:", len(dataloader.X_profiling))
             print("Attack traces:", len(dataloader.X_attack))
             print("Trace length:", dataloader.X_profiling.shape[1])
-
-            # ---------------- Train ----------------
-            model = trainer(
-                config, num_epochs, num_sample_pts,
-                dataloaders, dataset_sizes,
+            # Train the model (trainer monitors GE and saves best checkpoint)
+            model = trainer(config, num_epochs, num_sample_pts, dataloaders, dataset_sizes,
                 model_type, classes, device,
-                X_attack=X_attack,
-                plains_attack=plt_attack,
+                X_attack=X_attack, plains_attack=plt_attack,
                 save_file=model_path,
                 model_id=num_models,
-                log_file=log_file
-            )
-
+                log_file=log_file)
         else:
+            # Reload previously saved model
             config = np.load(config_path, allow_pickle=True).item()
-            model = ConvTF(
-                num_sample_pts,
-                num_classes=classes,
-                n_heads=config["heads"],
-                n_layers=config["layers"]
-            ).to(device)
-
+            model = ConvTF(num_sample_pts, num_classes=classes,
+                           n_heads=config["heads"], n_layers=config["layers"]).to(device)
             model.load_state_dict(torch.load(model_path))
 
-        # ---------------- Evaluation ----------------
-        GE, NTGE = evaluate(
-            device, model,
-            X_attack, plt_attack, correct_key,
-            leakage_fn=leakage_fn,
-            nb_attacks=nb_attacks,
-            total_nb_traces_attacks=total_nb_traces_attacks,
-            nb_traces_attacks=nb_traces_attacks
-        )
-
+        # Final evaluation (full attack set)
+        GE, NTGE = evaluate(device, model, X_attack, plt_attack, correct_key,
+                            leakage_fn=leakage_fn,
+                            nb_attacks=nb_attacks,
+                            total_nb_traces_attacks=total_nb_traces_attacks,
+                            nb_traces_attacks=nb_traces_attacks)
         np.save(os.path.join(model_root, f"GE_curve_{num_models}.npy"), GE)
+        
 
-        # ---------------- Plot ----------------
         plt.figure()
         plt.plot(range(len(GE)), GE, label="ConvTF Hybrid")
         plt.legend()
@@ -205,9 +171,5 @@ if __name__ == "__main__":
         plt.savefig(os.path.join(model_root, f"GE_curve_{num_models}.png"))
         plt.close()
 
-        np.save(
-            os.path.join(model_root, f"result_{num_models}.npy"),
-            {"GE": GE, "NTGE": NTGE}
-        )
-
+        np.save(os.path.join(model_root, f"result_{num_models}.npy"), {"GE": GE, "NTGE": NTGE})
         print(f"[MODEL {num_models}] NTGE={NTGE}, GE@100k={GE[-1]}")

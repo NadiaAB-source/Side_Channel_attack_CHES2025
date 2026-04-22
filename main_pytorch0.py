@@ -6,7 +6,7 @@ CHES 2025 Main Script (ConvTF Training + Evaluation)
 - Monitors Guessing Entropy (GE) each epoch
 """
 
-from src.dataloader import ToTensor_trace, Custom_Dataset
+from src.dataloader_v0 import ToTensor_trace, Custom_Dataset
 from src.net import ConvTF
 from src.trainer import trainer
 from src.utils import evaluate, AES_Sbox
@@ -29,7 +29,7 @@ if __name__ == "__main__":
     total_nb_traces_attacks = 10000
 
     # ---------------- Directories ----------------
-    root = "./Result00/"
+    root = "./Result000/"
     save_root = os.path.join(root, f"{dataset}_{model_type}_{leakage}")
     model_root = os.path.join(save_root, "models")
 
@@ -83,7 +83,7 @@ if __name__ == "__main__":
     dataloader.choose_phase("train")
 
     # ---------------- MIX ATTACK INTO TRAINING ----------------
-    num_attack_train = 80000  # use 80K attack for training
+    num_attack_train = 95000
 
     X_mix = np.concatenate([
         dataloader.X_profiling,
@@ -95,9 +95,8 @@ if __name__ == "__main__":
         dataloader.Y_attack[:num_attack_train]
     ], axis=0).copy()
 
-    # overwrite training set
-    dataloader.X_profiling = X_mix
-    dataloader.Y_profiling = Y_mix
+    X_attack = dataloader.X_attack[num_attack_train:]
+    plt_attack = dataloader.plt_attack[num_attack_train:]
 
     # ---------------- Attack set for evaluation ----------------
     correct_key = 127
